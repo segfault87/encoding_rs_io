@@ -10,6 +10,7 @@ keywords = ["encoding", "transcoding", "stream", "io", "read"]
 license = "MIT OR Apache-2.0"
 categories = ["text-processing", "encoding", "web-programming", "email"]
 exclude = ["/ci/*", "/.travis.yml", "/appveyor.yml"]
+edition = "2018"
 
 [badges]
 travis-ci = { repository = "BurntSushi/encoding_rs_io" }

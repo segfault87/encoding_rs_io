@@ -93,6 +93,8 @@ extern crate encoding_rs;
 use std::fmt;
 use std::io::{self, Read};
 
+#[cfg(feature = "async")]
+use async_std::io as asyncio;
 use encoding_rs::{Decoder, Encoding, UTF_8};
 
 use util::{BomPeeker, TinyTranscoder};
@@ -137,6 +139,12 @@ impl DecodeReaderBytesBuilder {
         self.build_with_buffer(rdr, vec![0; 8 * (1 << 10)]).unwrap()
     }
 
+    /// Build a new asyncrhonous decoder that wraps the given reader.
+    #[cfg(feature = "async")]
+    pub fn build_async<R: asyncio::Read + Unpin>(&self, rdr: R) -> DecodeReaderBytes<R, Vec<u8>> {
+        self.build_with_buffer_async(rdr, vec![0; 8 * (1 << 10)]).unwrap()
+    }
+
     /// Build a new decoder that wraps the given reader and uses the given
     /// buffer internally for transcoding.
     ///
@@ -170,6 +178,54 @@ impl DecodeReaderBytesBuilder {
             BomPeeker::without_bom(rdr)
         } else {
             BomPeeker::with_bom(rdr)
+        };
+        Ok(DecodeReaderBytes {
+            rdr: peeker,
+            decoder: encoding,
+            tiny: TinyTranscoder::new(),
+            utf8_passthru: self.utf8_passthru,
+            buf: buffer,
+            buflen: 0,
+            pos: 0,
+            has_detected: has_detected,
+            exhausted: false,
+        })
+    }
+
+    /// Build a new decoder that wraps the given reader and uses the given
+    /// buffer internally for transcoding.
+    ///
+    /// This is useful for cases where it is advantageuous to amortize
+    /// allocation. Namely, this method permits reusing a buffer for
+    /// subsequent decoders.
+    ///
+    /// This returns an error if the buffer is smaller than 4 bytes (which is
+    /// too small to hold maximum size of a single UTF-8 encoded codepoint).
+    #[cfg(feature = "async")]
+    pub fn build_with_buffer_async<R: asyncio::Read + Unpin, B: AsMut<[u8]>>(
+        &self,
+        rdr: R,
+        mut buffer: B,
+    ) -> io::Result<DecodeReaderBytes<R, B>> {
+        if buffer.as_mut().len() < 4 {
+            let msg = format!(
+                "DecodeReaderBytesBuilder: buffer of size {} is too small",
+                buffer.as_mut().len(),
+            );
+            return Err(io::Error::new(io::ErrorKind::Other, msg));
+        }
+        let encoding =
+            self.encoding.map(|enc| enc.new_decoder_with_bom_removal());
+
+        // No need to do BOM detection if we opt out of it or have an explicit
+        // encoding.
+        let has_detected =
+            !self.bom_sniffing || (!self.bom_override && encoding.is_some());
+
+        let peeker = if self.strip_bom {
+            BomPeeker::without_bom_async(rdr)
+        } else {
+            BomPeeker::with_bom_async(rdr)
         };
         Ok(DecodeReaderBytes {
             rdr: peeker,
@@ -551,6 +607,160 @@ impl<R: io::Read, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
             self.exhausted = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "async")]
+impl<R: asyncio::Read + Unpin, B: AsMut<[u8]>> DecodeReaderBytes<R, B> {
+    /// Transcode the inner stream to UTF-8 in `buf`. This assumes that there
+    /// is a decoder capable of transcoding the inner stream to UTF-8. This
+    /// returns the number of bytes written to `buf`.
+    ///
+    /// When this function returns, exactly one of the following things will
+    /// be true:
+    ///
+    /// 1. A non-zero number of bytes were written to `buf`.
+    /// 2. The underlying reader reached EOF (or `buf` is empty).
+    /// 3. An error is returned: the internal buffer ran out of room.
+    /// 4. An I/O error occurred.
+    /// 
+    /// This is async variant on `DecodeReaderBytes::transcode()`.
+    async fn transcode_async(&mut self, buf: &mut [u8]) -> asyncio::Result<usize> {
+        if self.exhausted || buf.is_empty() {
+            return Ok(0);
+        }
+        let nwrite = self.tiny.read(buf)?;
+        if nwrite > 0 {
+            // We could technically mush on if the caller provided buffer is
+            // big enough, but to keep things we simple, we satisfy the
+            // contract and quit.
+            return Ok(nwrite);
+        }
+        if self.pos >= self.buflen {
+            self.fill_async().await?;
+        }
+        if buf.len() < 4 {
+            return self.tiny_transcode_async(buf).await;
+        }
+        loop {
+            let (_, nin, nout, _) =
+                self.decoder.as_mut().unwrap().decode_to_utf8(
+                    &self.buf.as_mut()[self.pos..self.buflen],
+                    buf,
+                    false,
+                );
+            self.pos += nin;
+            // If we've written at least one byte to the caller-provided
+            // buffer, then our mission is complete.
+            if nout > 0 {
+                return Ok(nout);
+            }
+            // Otherwise, we know that our internal buffer has insufficient
+            // data to transcode at least one char, so we attempt to refill it.
+            self.fill_async().await?;
+            // ... but quit on EOF.
+            if self.buflen == 0 {
+                let (_, _, nout, _) = self
+                    .decoder
+                    .as_mut()
+                    .unwrap()
+                    .decode_to_utf8(&[], buf, true);
+                return Ok(nout);
+            }
+        }
+    }
+
+    /// Like transcode, but deals with the case where the caller provided
+    /// buffer is less than 4.
+    async fn tiny_transcode_async(&mut self, buf: &mut [u8]) -> asyncio::Result<usize> {
+        assert!(buf.len() < 4, "have a small caller buffer");
+        loop {
+            let (nin, nout) = self.tiny.transcode(
+                self.decoder.as_mut().unwrap(),
+                &self.buf.as_mut()[self.pos..self.buflen],
+                false,
+            );
+            self.pos += nin;
+            if nout > 0 {
+                // We've satisfied the contract of writing at least one byte,
+                // so we're done. The tiny transcoder is guaranteed to yield
+                // a non-zero number of bytes.
+                return self.tiny.read(buf);
+            }
+            // Otherwise, we know that our internal buffer has insufficient
+            // data to transcode at least one char, so we attempt to refill it.
+            self.fill_async().await?;
+            // ... but quit on EOF.
+            if self.buflen == 0 {
+                self.tiny.transcode(self.decoder.as_mut().unwrap(), &[], true);
+                return self.tiny.read(buf);
+            }
+        }
+    }
+
+    /// Peeks at the underlying reader to look for a BOM. If one exists, then
+    /// an appropriate decoder is created corresponding to the detected BOM.
+    async fn detect_async(&mut self) -> asyncio::Result<()> {
+        if self.has_detected {
+            return Ok(());
+        }
+        self.has_detected = true;
+        let bom = self.rdr.peek_bom_async().await?;
+        if let Some(encoding) = bom.encoding() {
+            // If we got a UTF-8 BOM, and the decoder was configured for
+            // passing through UTF-8, then don't build a decoder at all.
+            if encoding == UTF_8 && self.utf8_passthru {
+                return Ok(());
+            }
+            self.decoder = Some(encoding.new_decoder_with_bom_removal());
+        }
+        Ok(())
+    }
+
+    /// Fill the internal buffer from the underlying reader.
+    ///
+    /// If there are unread bytes in the internal buffer, then we move them
+    /// to the beginning of the internal buffer and fill the remainder.
+    ///
+    /// If the internal buffer is too small to read additional bytes, then an
+    /// error is returned.
+    async fn fill_async(&mut self) -> asyncio::Result<()> {
+        if self.pos < self.buflen {
+            // Despite my best efforts, I could not seem to actually exercise
+            // this code path in tests. Namely, this code path occurs when the
+            // decoder can't make any progress and also doesn't consume all of
+            // the input. Since I'm not sure how to trigger that case, this
+            // code path is actually untested!
+
+            // We can assert this because we require that the caller provided
+            // buffer be at least 4 bytes big.
+            assert!(
+                self.buflen < self.buf.as_mut().len(),
+                "internal buffer should never be exhausted"
+            );
+            let buf = self.buf.as_mut();
+            for (dst, src) in (self.pos..self.buflen).enumerate() {
+                buf[dst] = buf[src];
+            }
+            self.buflen -= self.pos;
+        } else {
+            self.buflen = 0;
+        }
+        self.pos = 0;
+        self.buflen += self.rdr.read_async(&mut self.buf.as_mut()[self.buflen..]).await?;
+        if self.buflen == 0 {
+            self.exhausted = true;
+        }
+        Ok(())
+    }
+
+    pub async fn read_async(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.detect_async().await?;
+        if self.decoder.is_none() {
+            self.rdr.read_async(buf).await
+        } else {
+            self.transcode_async(buf).await
+        }
     }
 }
 

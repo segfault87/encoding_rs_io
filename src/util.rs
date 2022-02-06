@@ -1,6 +1,11 @@
 use std::cmp;
 use std::io;
 
+#[cfg(feature = "async")]
+use async_std::{
+    io::{self as asyncio, ReadExt},
+};
+
 use encoding_rs::{CoderResult, Decoder, Encoding};
 
 /// This is the minimum amount of space that a decoder-to-utf8-with-replacement
@@ -122,7 +127,7 @@ impl<R: io::Read> BomPeeker<R> {
 
     /// Create a new BomPeeker that never includes the BOM in calls to `read`.
     pub fn without_bom(rdr: R) -> BomPeeker<R> {
-        BomPeeker { rdr: rdr, strip: true, bom: None, nread: 0 }
+        BomPeeker { rdr: rdr, strip: false, bom: None, nread: 0 }
     }
 
     /// Peek at the first three bytes of the underlying reader.
@@ -165,6 +170,66 @@ impl<R: io::Read> io::Read for BomPeeker<R> {
             }
         }
         let nread = self.rdr.read(buf)?;
+        self.nread += nread;
+        Ok(nread)
+    }
+}
+
+#[cfg(feature = "async")]
+impl<R: asyncio::Read + Unpin> BomPeeker<R> {
+    /// Create a new asynchronous BomPeeker that includes the BOM in calls to `read`.
+    ///
+    /// The first three bytes can be read using the `peek_bom` method, but
+    /// will not advance the reader.
+    pub fn with_bom_async(rdr: R) -> BomPeeker<R> {
+        BomPeeker { rdr: rdr, strip: false, bom: None, nread: 0 }
+    }
+
+    /// Create a new asynchronous BomPeeker that never includes the BOM in calls to `read`.
+    pub fn without_bom_async(rdr: R) -> BomPeeker<R> {
+        BomPeeker { rdr: rdr, strip: true, bom: None, nread: 0 }
+    }
+
+    /// Peek at the first three bytes of the underlying reader.
+    ///
+    /// This does not advance the reader provided by `BomPeeker`.
+    ///
+    /// If the underlying reader does not have at least two bytes available,
+    /// then `None` is returned.
+    /// 
+    /// This is async variant on `BomPeeker::peek_bom`. 
+    pub async fn peek_bom_async(&mut self) -> io::Result<PossibleBom> {
+        if let Some(bom) = self.bom {
+            return Ok(bom);
+        }
+        // If the underlying reader fails or panics, make sure we set at least
+        // an empty BOM so that we don't end up here again..
+        self.bom = Some(PossibleBom::new());
+
+        // OK, try to read the BOM.
+        let mut buf = [0u8; 3];
+        let bom_len = read_full_async(&mut self.rdr, &mut buf).await?;
+        self.bom = Some(PossibleBom { bytes: buf, len: bom_len });
+        Ok(self.bom.unwrap())
+    }
+
+    pub async fn read_async(&mut self, buf: &mut [u8]) -> asyncio::Result<usize> {
+        if self.nread < 3 {
+            let bom = self.peek_bom_async().await?;
+
+            // If we don't have a valid BOM (e.g., no encoding for it), then
+            // we always pass through the first 3 bytes. Otherwise, if we have
+            // a valid BOM, we only pass it thru if we don't want to strip it.
+            let bom = bom.as_slice(!self.strip);
+            if self.nread < bom.len() {
+                let rest = &bom[self.nread..];
+                let len = cmp::min(buf.len(), rest.len());
+                buf[..len].copy_from_slice(&rest[..len]);
+                self.nread += len;
+                return Ok(len);
+            }
+        }
+        let nread = self.rdr.read(buf).await?;
         self.nread += nread;
         Ok(nread)
     }
@@ -229,6 +294,29 @@ pub fn read_full<R: io::Read>(
     let mut nread = 0;
     while !buf.is_empty() {
         match rdr.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                nread += n;
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(nread)
+}
+
+/// Like `io::Read::read_exact`, except it never returns `UnexpectedEof` and
+/// instead returns the number of bytes read if EOF is seen before filling
+/// `buf`. This is async variant on `read_full`.
+pub async fn read_full_async<R: asyncio::Read + Unpin>(
+    mut rdr: R,
+    mut buf: &mut [u8],
+) -> asyncio::Result<usize> {
+    let mut nread = 0;
+    while !buf.is_empty() {
+        match rdr.read(buf).await {
             Ok(0) => break,
             Ok(n) => {
                 nread += n;
